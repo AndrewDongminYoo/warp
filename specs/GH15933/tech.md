@@ -81,7 +81,7 @@ The existing OSC 777 protocol needs no new event name. `permission_request` alre
 
 ### 3. Warp client — no protocol change required
 
-With (1) and (2) in place, the client needs no change to satisfy invariants 1 through 8, 11, and 13 through 15: `permission_request` continues to mean `Blocked`, the navigated-away gate continues to apply, and the existing clearing paths continue to work.
+With (1) and (2) in place, the client needs no change to satisfy invariants 1 through 8, 10, 11, and 13 through 15: `permission_request` continues to mean `Blocked`, the navigated-away gate continues to apply, rich input keeps closing on the same `Blocked` transition at `view.rs:13783` — which under (2) only a request that reached the user can cause — and the existing clearing paths continue to work.
 
 Invariant 14 deserves the route-by-route version, because the design adds no resolution signal and it is fair to ask how each route leaves `Blocked` without one. The answer is that under (2) `Blocked` is only ever entered on escalation, and every route out of it is already an event the plugin emits and the client handles:
 
@@ -101,7 +101,7 @@ One consequence is worth naming rather than hiding in the table. After a refusal
 Two product invariants may need client work, and both are deliberately left open rather than designed here:
 
 - Invariant 9's open question, whether a request under automatic review should present as a distinct third state. A new state would touch `CLIAgentSessionStatus` at [`mod.rs:24-39`](https://github.com/warpdotdev/warp/blob/a06279712f838d01295575b0dc0f14b7a34ba049/app/src/terminal/cli_agent_sessions/mod.rs#L24-L39) and every surface that matches on it. Under (2) the smaller answer comes for free: with no event emitted, the session simply stays `InProgress`.
-- Invariant 12's version skew is handled in the plugin under (2), so the client needs no version gate. If that placement turns out to be wrong, the client already receives `plugin_version` on `session_start` and could gate on it.
+- Invariant 12's version skew is handled in the plugin under (2), and it cannot move to the client. The skew is between the plugin and Codex, not between the plugin and Warp, so the `plugin_version` the client receives on `session_start` says nothing about it; and by the time an event reaches the client the decision it would gate has already been made, because the notification is sent on the transition the event causes.
 
 ## Testing and validation
 
