@@ -45,13 +45,17 @@ One point remains observational rather than measured. That the `PermissionReques
 
 Two things are needed, and asking for only the first leaves the plugin unable to use it safely.
 
-**The event.** A hook event that fires at the moment Codex determines a permission request requires a human decision, carrying **the same fields as `permission-request.command.input`** — in particular `tool_name` and `tool_input` — plus, ideally, why it escalated: the reviewer declined, the review timed out, errored, or was interrupted, or no reviewer is configured and the user is asked directly. That last reason is not an edge case — it is every request under `approvals_reviewer = "user"`, and it is how invariant 13 holds under (2): the request script stays quiet and the escalation script emits at once.
+**The event.** A hook event that fires at the moment Codex determines a permission request requires a human decision. Three properties are required, not preferred, because (2) routes every notification through this event once the capability is present and each property is what one invariant stands on:
+
+- **It fires on every request that reaches the user, whatever the reviewer configuration, including none.** Under `approvals_reviewer = "user"` there is no reviewer in the path and the request goes to the user at once; the event must fire then too. An implementation that fired only when a reviewer declined would leave the request script silent and the escalation script never running under `user`, which is the silent miss invariant 12 forbids and would break invariant 13 outright. This is the property most worth stating to upstream, because "fires when the reviewer declines" is the natural first reading of the request.
+- **It carries the same fields as `permission-request.command.input`**, `tool_name` and `tool_input` in particular. Invariant 2 depends on this; see below.
+- **It carries why it escalated**: the reviewer declined, the review timed out, errored, or was interrupted, or no reviewer is configured. Invariant 7's fixture-level test depends on this; without a reason the escalations are indistinguishable at the plugin and invariant 7 has manual coverage only.
 
 The payload has to be that complete because the escalation script is the one that will build the notification. Product invariant 2 keeps the notification's description as the request's own summary, and today [`on-permission-request.sh`](https://github.com/warpdotdev/codex-warp/blob/main/plugins/warp/scripts/on-permission-request.sh) builds that summary from `tool_name` and `tool_input`. Under (2) that script stops emitting, so whatever it could have said has to be available to `on-permission-escalated.sh` instead.
 
 The alternative — the request script stashing its payload under `PLUGIN_DATA` for the escalation script to read back — does not work on today's contract. The only correlation key `permission-request.command.input` offers is `session_id` plus `turn_id` plus `tool_name`, and that is not unique within a turn that requests the same tool twice. `tool_use_id`, which would make it unique, is carried by `pre-tool-use` and `post-tool-use` but not by `permission-request`. So a stash would need `tool_use_id` added to `PermissionRequest` as well, which is a second upstream ask to avoid the first. Carrying the payload on the event is simpler for everyone and keeps the plugin stateless.
 
-The escalation reason is not needed for the gate or the notification, but it is what makes invariant 7 testable at the fixture level rather than only by manual reproduction; see Testing.
+The escalation reason is not consulted by the gate or by the notification itself — every escalation is emitted alike — but it is what makes invariant 7 testable at the fixture level rather than only by manual reproduction, and it is what lets a future client distinguish "the user was asked because a reviewer declined" from "the user was asked directly" should invariant 9's open question resolve toward a richer status; see Testing.
 
 **A capability signal the hook process can read.** Without one, a plugin cannot tell "this Codex will fire the escalation event, so stay quiet at request time" from "this Codex never will, so notify now" — and guessing wrong in the quiet direction is the silent miss invariant 12 forbids. The absence of an event is not observable at the moment the decision has to be made.
 
@@ -89,6 +93,11 @@ The existing OSC 777 protocol needs no new event name. `permission_request` alre
 
 With (1) and (2) in place, the client needs no change to satisfy invariants 1 through 8, 10, 11, and 13 through 15: `permission_request` continues to mean `Blocked`, the navigated-away gate continues to apply, rich input keeps closing on the same `Blocked` transition at `view.rs:13783` — which under (2) only a request that reached the user can cause — and the existing clearing paths continue to work.
 
+Two of those deserve their mechanism named, since neither is visible in the plugin change:
+
+- Invariant 11 holds because the channel is per-terminal and so is the state. An OSC 777 sequence reaches only the terminal whose PTY emitted it, and [`CLIAgentSessionsModel` keys sessions by terminal view at `mod.rs:355`](https://github.com/warpdotdev/warp/blob/a06279712f838d01295575b0dc0f14b7a34ba049/app/src/terminal/cli_agent_sessions/mod.rs#L355), so one session's escalation cannot touch another's status.
+- Invariant 15 holds because (2) touches only the permission scripts. `on-stop.sh` and the client's `Stop` and `StopFailure` arms are not in the diff, and a turn that ends after any permission outcome still reaches them the same way.
+
 Invariant 14 deserves the route-by-route version, because the design adds no resolution signal and it is fair to ask how each route leaves `Blocked` without one. The answer is that under (2) `Blocked` is only ever entered on escalation, and every route out of it is already an event the plugin emits and the client handles:
 
 | Route | What the plugin emits | What clears `Blocked` |
@@ -113,7 +122,7 @@ Two product invariants may need client work, and both are deliberately left open
 
 Product invariants are numbered in [`product.md`](./product.md); each is listed here against what would prove it.
 
-**Warp client, `cargo nextest run -p warp -E 'test(cli_agent_sessions)'`.** The client's mapping is unchanged, so its existing coverage is the regression suite for invariants 1, 2, 14, and 15: `permission_request` maps to `Blocked`, `permission_replied` and `tool_complete` clear it, and `stop` and `stop_failure` are untouched. If invariant 9 resolves toward a distinct state, that state needs its own cases for the status mapping and for each surface that matches on `CLIAgentSessionStatus`.
+**Warp client, `cargo nextest run -p warp -E 'test(cli_agent_sessions)'`.** The client's mapping is unchanged, so its existing coverage is the regression suite for the client's half of invariants 1, 2, 14, and 15: `permission_request` maps to `Blocked` and `Blocked` raises exactly one needs-attention notification behind the navigated-away gate, `permission_replied` and `tool_complete` clear it, and `stop` and `stop_failure` are untouched. The other half of invariant 2 — that the notification's description is still the request's own summary — is decided by what the escalation script puts in the event body, and is covered under the plugin scripts below. If invariant 9 resolves toward a distinct state, that state needs its own cases for the status mapping and for each surface that matches on `CLIAgentSessionStatus`.
 
 **Plugin scripts, `warpdotdev/codex-warp`.** Shell-level tests over the emission decision, driving each script with a recorded hook payload on stdin and asserting the OSC 777 body:
 
@@ -124,7 +133,8 @@ The capability gate from (2) is what these tests are really pinning, so each cas
 - Invariant 12: capability absent, `PermissionRequest` alone — `on-permission-request.sh` still emits `permission_request`. This is the case most worth pinning, because its failure mode is silence rather than a visible error.
 - The gate's own falsifiability: a case that removes the capability signal and asserts the emission comes back. A gate that is never observed failing is not evidence, and this one decides between over-notifying and going quiet.
 - Exactly one emission per request across both scripts, so a build where both paths fire does not double-notify.
-- Invariant 7, fixture half: an escalation payload whose reason is a review timeout, and another whose reason is a review error, each produce the same `permission_request` emission as a reviewer decline. This only exists as a test if the event carries a reason, which is why (1) asks for one; without it the three escalations are indistinguishable at the plugin and the case collapses into the invariant 2 case above.
+- Invariant 7, fixture half: an escalation payload whose reason is a review timeout, and another whose reason is a review error, each produce the same `permission_request` emission as a reviewer decline. This test exists because (1) requires the event to carry a reason; it is the concrete thing that requirement buys.
+- Invariant 13, fixture half: an escalation payload whose reason is "no reviewer configured" produces the same emission. This pins the first required property of the event from the plugin's side — the script treats a direct-to-user request exactly like an escalated one — though whether Codex fires the event in that case at all is upstream's to prove and is in the manual list.
 
 The fixture half proves the plugin treats every escalation alike. It cannot prove Codex escalates on a timeout at all, which is the half of invariant 7 whose failure mode is a user waiting in silence; that half is in the manual list below.
 
