@@ -45,7 +45,13 @@ One point remains observational rather than measured. That the `PermissionReques
 
 Two things are needed, and asking for only the first leaves the plugin unable to use it safely.
 
-**The event.** A hook event that fires at the moment Codex determines a permission request requires a human decision, carrying at least the `session_id`, `turn_id`, and `tool_name` of the request it refers to, so a consumer can correlate it with the `PermissionRequest` that opened it.
+**The event.** A hook event that fires at the moment Codex determines a permission request requires a human decision, carrying **the same fields as `permission-request.command.input`** — in particular `tool_name` and `tool_input` — plus, ideally, why it escalated: the reviewer declined, the review timed out, errored, or was interrupted, or no reviewer is configured and the user is asked directly. That last reason is not an edge case — it is every request under `approvals_reviewer = "user"`, and it is how invariant 13 holds under (2): the request script stays quiet and the escalation script emits at once.
+
+The payload has to be that complete because the escalation script is the one that will build the notification. Product invariant 2 keeps the notification's description as the request's own summary, and today [`on-permission-request.sh`](https://github.com/warpdotdev/codex-warp/blob/main/plugins/warp/scripts/on-permission-request.sh) builds that summary from `tool_name` and `tool_input`. Under (2) that script stops emitting, so whatever it could have said has to be available to `on-permission-escalated.sh` instead.
+
+The alternative — the request script stashing its payload under `PLUGIN_DATA` for the escalation script to read back — does not work on today's contract. The only correlation key `permission-request.command.input` offers is `session_id` plus `turn_id` plus `tool_name`, and that is not unique within a turn that requests the same tool twice. `tool_use_id`, which would make it unique, is carried by `pre-tool-use` and `post-tool-use` but not by `permission-request`. So a stash would need `tool_use_id` added to `PermissionRequest` as well, which is a second upstream ask to avoid the first. Carrying the payload on the event is simpler for everyone and keeps the plugin stateless.
+
+The escalation reason is not needed for the gate or the notification, but it is what makes invariant 7 testable at the fixture level rather than only by manual reproduction; see Testing.
 
 **A capability signal the hook process can read.** Without one, a plugin cannot tell "this Codex will fire the escalation event, so stay quiet at request time" from "this Codex never will, so notify now" — and guessing wrong in the quiet direction is the silent miss invariant 12 forbids. The absence of an event is not observable at the moment the decision has to be made.
 
@@ -62,7 +68,7 @@ This is the only proposal here that satisfies the product spec, and the reason i
 - **Delaying the emission and retracting it is not available.** Invariant 4 rules out emitting and withdrawing, because a desktop notification cannot be withdrawn, and invariant 5 rules out waiting a fixed interval before emitting.
 - **`PostToolUse` cannot substitute.** It fires after the tool ran, so it can tell Warp a request was resolved but cannot prevent the notification that was already sent.
 
-The event's name and exact payload are upstream's to choose. What this spec asks for is its timing: it must fire when Codex decides to ask the user, not when the request is created.
+The event's name and wire shape are upstream's to choose. What this spec asks for is its timing — it must fire when Codex decides to ask the user, not when the request is created — and that it carry enough to build the notification without a second lookup, as set out above.
 
 ### 2. Emit on the new event instead — `warpdotdev/codex-warp`
 
@@ -118,12 +124,17 @@ The capability gate from (2) is what these tests are really pinning, so each cas
 - Invariant 12: capability absent, `PermissionRequest` alone — `on-permission-request.sh` still emits `permission_request`. This is the case most worth pinning, because its failure mode is silence rather than a visible error.
 - The gate's own falsifiability: a case that removes the capability signal and asserts the emission comes back. A gate that is never observed failing is not evidence, and this one decides between over-notifying and going quiet.
 - Exactly one emission per request across both scripts, so a build where both paths fire does not double-notify.
+- Invariant 7, fixture half: an escalation payload whose reason is a review timeout, and another whose reason is a review error, each produce the same `permission_request` emission as a reviewer decline. This only exists as a test if the event carries a reason, which is why (1) asks for one; without it the three escalations are indistinguishable at the plugin and the case collapses into the invariant 2 case above.
+
+The fixture half proves the plugin treats every escalation alike. It cannot prove Codex escalates on a timeout at all, which is the half of invariant 7 whose failure mode is a user waiting in silence; that half is in the manual list below.
 
 **Manual validation.** The distinction under test only exists in a real Codex session, so this cannot be reduced to unit tests. On macOS, with Warp navigated away from the Codex pane:
 
 - `approvals_reviewer = "user"` with `approval_policy = "on-request"` — every permission request notifies. Invariant 13.
 - `approvals_reviewer = "auto_review"` with a request the reviewer approves — no notification, and the session keeps running. Invariant 1.
 - `approvals_reviewer = "auto_review"` with a request the reviewer declines into a human decision — one notification, arriving when Codex asks. Invariants 2, 4, 6.
+- `approvals_reviewer = "auto_review"` with the review unable to complete — one notification, arriving when Codex falls back to asking. Invariant 7. Codex's own UI carries the string `Review timed out before codex could run`, so a timeout path exists; the cleanest way to force it is to point the reviewer at a model that cannot answer, and the binary carries an `auto_review_model_override` key that looks like the knob for that, though it was not exercised here and the exact config should be confirmed against Codex's documentation before the plan is relied on. If no reliable way to force a timeout is found, the case is recorded as unverified rather than assumed, because its failure mode is the one this spec exists to prevent.
+- `approvals_reviewer = "guardian_subagent"`, the same three cases as `auto_review` — approve, decline into a human decision, and unable to complete — where that reviewer is available to the tester. The product spec covers it by construction, since the invariants are phrased by whether a request reaches the user; this is the evidence that the construction holds. If it is not available, say so in the implementation PR rather than inferring it from the `auto_review` results.
 - Two Codex sessions in one window, one under review and one waiting on the user — exactly one notification. Invariant 11.
 - With rich input open and the window focused, a request the reviewer approves leaves rich input open, and a request that reaches the user closes it. Invariant 10. This is the in-app counterpart of the notification cases, and it exercises [`view.rs:13783`](https://github.com/warpdotdev/warp/blob/a06279712f838d01295575b0dc0f14b7a34ba049/app/src/terminal/view.rs#L13783) rather than the navigated-away gate, so it cannot be inferred from them.
 - The same passes against a Codex build without the new event, to confirm today's behavior survives. Invariant 12.

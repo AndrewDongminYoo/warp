@@ -31,7 +31,7 @@ The same signal drives Warp's in-app session status, so the vertical tab and age
 - The condition under which Warp raises a needs-attention notification for a Codex permission request.
 - The in-app session status shown for a request that is under automatic review rather than waiting on the user.
 - The behavior required when Codex or the plugin is too old to report the distinction.
-- Behavior across every value of `approvals_reviewer`, not only `auto_review`.
+- Behavior across every value of `approvals_reviewer`. Codex has three — `user`, `auto_review`, and `guardian_subagent` — and the invariants below are written in terms of whether a request reaches the user rather than which reviewer handled it, so `guardian_subagent` is covered by the same invariants as `auto_review` and needs no separate ones. What differs is evidence: the `auto_review` path is what the issue reports and what this spec's investigation exercised, and the `guardian_subagent` path was not exercised, so it is listed for validation rather than assumed.
 
 **Out of scope**
 
@@ -43,7 +43,7 @@ The same signal drives Warp's in-app session status, so the vertical tab and age
 
 ## Behavior
 
-1. A Codex permission request that Codex resolves without asking the user raises no needs-attention notification, at any point in its lifetime. This covers a request approved by the automatic reviewer and a request allowed by policy without review.
+1. A Codex permission request that Codex resolves without asking the user raises no needs-attention notification, at any point in its lifetime. This covers a request approved by a configured reviewer of either kind, `auto_review` or `guardian_subagent`, and a request allowed by policy without review.
 
 2. A Codex permission request that reaches the user and waits for their decision raises exactly one needs-attention notification, subject to the existing gate in (3). The notification's title and description keep their current content: the session's query or summary, and the request's own summary text.
 
