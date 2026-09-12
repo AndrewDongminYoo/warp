@@ -83,6 +83,21 @@ The existing OSC 777 protocol needs no new event name. `permission_request` alre
 
 With (1) and (2) in place, the client needs no change to satisfy invariants 1 through 8, 11, and 13 through 15: `permission_request` continues to mean `Blocked`, the navigated-away gate continues to apply, and the existing clearing paths continue to work.
 
+Invariant 14 deserves the route-by-route version, because the design adds no resolution signal and it is fair to ask how each route leaves `Blocked` without one. The answer is that under (2) `Blocked` is only ever entered on escalation, and every route out of it is already an event the plugin emits and the client handles:
+
+| Route | What the plugin emits | What clears `Blocked` |
+| --- | --- | --- |
+| Reviewer approves | nothing — no escalation, so never `Blocked` | nothing to clear |
+| Reviewer denies, Codex abandons the action | nothing — same | nothing to clear |
+| Reviewer denies or times out, Codex asks the user | `permission_request` on escalation | one of the rows below |
+| User approves | `tool_complete` from `on-post-tool-use.sh` | [`mod.rs:216-222`](https://github.com/warpdotdev/warp/blob/a06279712f838d01295575b0dc0f14b7a34ba049/app/src/terminal/cli_agent_sessions/mod.rs#L216-L222) |
+| User refuses, Codex tries something else | `tool_complete` for that next tool — the arm does not check which tool completed | same |
+| User refuses, Codex ends its turn | `stop` from `on-stop.sh` | [`mod.rs:223-228`](https://github.com/warpdotdev/warp/blob/a06279712f838d01295575b0dc0f14b7a34ba049/app/src/terminal/cli_agent_sessions/mod.rs#L223-L228) |
+| User submits a new prompt | `prompt_submit` | [`mod.rs:210-214`](https://github.com/warpdotdev/warp/blob/a06279712f838d01295575b0dc0f14b7a34ba049/app/src/terminal/cli_agent_sessions/mod.rs#L210-L214) |
+| Session ends | Warp's own session teardown | the session is gone |
+
+One consequence is worth naming rather than hiding in the table. After a refusal, `Blocked` persists until Codex's next observable action — the next tool completing, or the turn ending — rather than clearing at the instant the user answered. That is today's behavior, it is the same shape the Claude Code plugin has, and the window is short because Codex acts on a refusal immediately. A `permission_replied` producer would close that window, and the Follow-ups section says why it cannot be built until (1) lands.
+
 Two product invariants may need client work, and both are deliberately left open rather than designed here:
 
 - Invariant 9's open question, whether a request under automatic review should present as a distinct third state. A new state would touch `CLIAgentSessionStatus` at [`mod.rs:24-39`](https://github.com/warpdotdev/warp/blob/a06279712f838d01295575b0dc0f14b7a34ba049/app/src/terminal/cli_agent_sessions/mod.rs#L24-L39) and every surface that matches on it. Under (2) the smaller answer comes for free: with no event emitted, the session simply stays `InProgress`.
@@ -110,6 +125,7 @@ The capability gate from (2) is what these tests are really pinning, so each cas
 - `approvals_reviewer = "auto_review"` with a request the reviewer approves — no notification, and the session keeps running. Invariant 1.
 - `approvals_reviewer = "auto_review"` with a request the reviewer declines into a human decision — one notification, arriving when Codex asks. Invariants 2, 4, 6.
 - Two Codex sessions in one window, one under review and one waiting on the user — exactly one notification. Invariant 11.
+- With rich input open and the window focused, a request the reviewer approves leaves rich input open, and a request that reaches the user closes it. Invariant 10. This is the in-app counterpart of the notification cases, and it exercises [`view.rs:13783`](https://github.com/warpdotdev/warp/blob/a06279712f838d01295575b0dc0f14b7a34ba049/app/src/terminal/view.rs#L13783) rather than the navigated-away gate, so it cannot be inferred from them.
 - The same passes against a Codex build without the new event, to confirm today's behavior survives. Invariant 12.
 
 A screen recording of the second and third cases is the evidence worth attaching to the implementation PR, since the difference between them is a notification that does and does not appear.

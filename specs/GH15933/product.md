@@ -70,7 +70,7 @@ The same signal drives Warp's in-app session status, so the vertical tab and age
 
 13. A user who configures no automatic reviewer sees no change whatsoever. Every permission request reaches them, and every one of them notifies under (2) and (3).
 
-14. The user's answer continues to clear the state a request created. Once a request is resolved by any route — the user answered, the reviewer answered, the tool ran, a new prompt was submitted, or the session ended — the session leaves the blocked presentation and its request summary stops appearing in the tab title and other surfaces that fall back to it.
+14. A request that reached the user leaves the blocked presentation once the session moves on, by whichever route that happens: the user's approval lets the tool run, the user's refusal leads Codex to its next action or to the end of its turn, a new prompt is submitted, or the session ends. Its request summary stops appearing in the tab title and other surfaces that fall back to it at the same moment. A request the reviewer resolved never entered the blocked presentation, so it has nothing to leave.
 
 15. Completion and failure notifications are untouched by this change. A session that finishes its turn notifies on completion, and one that fails notifies on failure, regardless of how any permission request within that turn was resolved.
 
