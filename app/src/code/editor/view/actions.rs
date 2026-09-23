@@ -8,7 +8,6 @@ use std::ops::Range;
 use lazy_static::lazy_static;
 use rangemap::RangeSet;
 use string_offset::CharOffset;
-use vim::vim::MotionType;
 use warp_editor::content::version::BufferVersion;
 use warp_editor::editor::{EmbeddedItemModel, RunnableCommandModel, TextDecoration};
 use warp_editor::model::{CoreEditorModel, PlainTextEditorModel};
@@ -21,18 +20,17 @@ use warpui::elements::Axis;
 use warpui::event::ModifiersState;
 use warpui::keymap::{EditableBinding, FixedBinding, Keystroke, PerPlatformKeystroke};
 use warpui::units::Pixels;
-use warpui::{AppContext, SingletonEntity, TypedActionView, ViewContext, WeakViewHandle};
+use warpui::{AppContext, TypedActionView, ViewContext, WeakViewHandle};
 
 use crate::cmd_or_ctrl_shift;
 use crate::code::editor::line::EditorLineLocation;
-use crate::code::editor::model::CodeEditorModel;
+use crate::code::editor::model::{CodeEditorModel, CopyOutcome};
 use crate::code::editor::view::{CodeEditorEvent, CodeEditorView, VimMode};
 use crate::code_review::comments::CommentId;
 use crate::editor::InteractionState;
 use crate::features::FeatureFlag;
 use crate::notebooks::editor::model::word_unit;
 use crate::util::bindings::CustomAction;
-use crate::vim_registers::{RegisterContent, VimRegisters};
 
 /// Limit the keybindings that conflict with the Agent Mode embedded editor.
 const NON_EDITABLE_KEYMAP_CONTEXT: &str = "NonEditableKeymapContext";
@@ -992,30 +990,9 @@ impl TypedActionView for CodeEditorView {
                 }
             }
             SelectionEnd => self.selection_end(ctx),
-            Paste => {
-                // A line copied with an empty selection goes back as a whole line above the
-                // cursor's line, the way VS Code and Zed paste one. `read_from_register`
-                // compares its stored entry against the live system clipboard, so anything
-                // copied since, in this app or another, falls back to a char-wise paste on
-                // its own.
-                let line_wise = if self.copy_line_when_selection_is_empty {
-                    VimRegisters::handle(ctx)
-                        .update(ctx, |registers, ctx| registers.read_from_register('+', ctx))
-                        .filter(|content| content.motion_type == MotionType::Linewise)
-                } else {
-                    None
-                };
-
-                if let Some(RegisterContent { text, .. }) = line_wise {
-                    self.model.update(ctx, |model, ctx| {
-                        model.paste_line_above_cursor(&text, ctx);
-                    });
-                } else {
-                    self.model.update(ctx, |model, ctx| {
-                        model.paste(ctx);
-                    });
-                }
-            }
+            Paste => self.model.update(ctx, |model, ctx| {
+                model.paste(ctx);
+            }),
             Cut => self.model.update(ctx, |model, ctx| {
                 model.cut(ctx);
             }),
@@ -1024,32 +1001,13 @@ impl TypedActionView for CodeEditorView {
             // The owner of the editor can also perform a copy by accessing the selected text and copying it to the clipboard.
             // This is the case when the code block is owned by an AIBlock and unfocused.
             Copy => {
-                let has_selection = self.selected_text(ctx).is_some();
-                // An editor that owns its copy shortcut outright copies the line holding
-                // the cursor instead of clearing the clipboard. Every other editor keeps
-                // the default, because a parent view may hold the selection the user
-                // meant to copy.
-                if !has_selection && self.copy_line_when_selection_is_empty {
-                    let line = self.model.as_ref(ctx).current_line_text(ctx);
-                    if let Some(line) = line {
-                        // Writing through the system-clipboard register puts the text on the
-                        // clipboard and records that it was a whole line, which is what lets
-                        // the matching paste put it back as a line. Plain clipboard text
-                        // would land at the caret and split the line pasted into.
-                        VimRegisters::handle(ctx).update(ctx, |registers, ctx| {
-                            registers.write_to_register('+', line, MotionType::Linewise, ctx);
-                        });
-                    }
-                } else {
-                    self.model.update(ctx, |model, ctx| {
-                        model.copy(ctx);
-                    });
-                    // It's possible that the copy action was dispatched to the focused editor even when
-                    // the user intended to copy selected text from a parent view (i.e. an `AIBlock`).
-                    // The `CopiedEmptyText` event gives the parent view a signal to attempt a copy action.
-                    if !has_selection {
-                        ctx.emit(CodeEditorEvent::CopiedEmptyText);
-                    }
+                let outcome = self.model.update(ctx, |model, ctx| model.copy(ctx));
+                // It's possible that the copy action was dispatched to the focused editor even when
+                // the user intended to copy selected text from a parent view (i.e. an `AIBlock`).
+                // The `CopiedEmptyText` event gives the parent view a signal to attempt a copy action.
+                // An editor that took the cursor's line has handled the copy itself, so it stays quiet.
+                if outcome == CopyOutcome::EmptySelection {
+                    ctx.emit(CodeEditorEvent::CopiedEmptyText);
                 }
             }
             #[cfg(windows)]

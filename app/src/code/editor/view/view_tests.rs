@@ -56,7 +56,7 @@ fn initialize_editor_copying_the_cursor_line(
             CodeEditorRenderOptions::new(VerticalExpansionBehavior::GrowToMaxHeight),
             ctx,
         )
-        .with_copy_line_when_selection_is_empty();
+        .with_copy_line_when_selection_is_empty(ctx);
         editor.reset(InitialBufferState::plain_text(&buffer_content), ctx);
         editor.handle_action(&CodeEditorViewAction::CursorAtBufferStart, ctx);
         editor

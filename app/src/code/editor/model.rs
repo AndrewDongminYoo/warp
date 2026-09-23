@@ -54,6 +54,7 @@ use warp_editor::render::model::{
 };
 use warp_editor::selection::{SelectionMode, SelectionModel, TextDirection, TextUnit};
 use warp_util::standardized_path::StandardizedPath;
+use warpui::clipboard::ClipboardContent;
 use warpui::elements::{
     AnchorPair, OffsetPositioning, OffsetType, PositionedElementOffsetBounds, PositioningAxis,
     XAxisAnchor, YAxisAnchor,
@@ -193,6 +194,22 @@ impl HoverableLink {
     }
 }
 
+/// What [`CodeEditorModel::copy`] put on the clipboard, so a view can tell whether
+/// the copy still needs handing to a parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyOutcome {
+    /// Selected text went to the clipboard.
+    Selection,
+    /// Nothing was selected, and this editor took the line holding the cursor.
+    CursorLine,
+    /// Nothing was selected and this editor takes the cursor's line, but there was
+    /// no line to take. The clipboard is left as it was rather than cleared.
+    NothingToCopy,
+    /// Nothing was selected, and this editor does not take the cursor's line, so a
+    /// parent view may hold the selection the user meant to copy.
+    EmptySelection,
+}
+
 pub enum CodeEditorModelEvent {
     /// Emitted when diff decorations are updated (line highlights, removed lines, etc.)
     DiffUpdated,
@@ -313,6 +330,14 @@ pub struct CodeEditorModel {
     lazy_layout_initialized: bool,
     /// Whether syntax parsing should be bootstrapped from the latest full buffer content.
     pending_syntax_tree_bootstrap: bool,
+    /// See [`CodeEditorModel::set_copy_line_when_selection_is_empty`].
+    copy_line_when_selection_is_empty: bool,
+    /// The text this editor last put on the clipboard as a whole line.
+    ///
+    /// [`CodeEditorModel::paste`] compares it against the live clipboard, so a copy
+    /// made anywhere else in between — another editor, another app — no longer
+    /// matches and falls back to a char-wise paste on its own.
+    line_wise_clipboard: Option<String>,
 }
 
 impl CodeEditorModel {
@@ -470,6 +495,8 @@ impl CodeEditorModel {
             lazy_layout_enabled,
             lazy_layout_initialized,
             pending_syntax_tree_bootstrap: false,
+            copy_line_when_selection_is_empty: false,
+            line_wise_clipboard: None,
         }
     }
 
@@ -1900,11 +1927,64 @@ impl CodeEditorModel {
         })
     }
 
+    /// Enables copying the line holding the cursor when a copy runs with an empty
+    /// selection, matching VS Code and Zed.
+    ///
+    /// Off by default, and it belongs only to editors that own their copy shortcut
+    /// outright. An editor embedded in an AI block, a diff view, or the terminal
+    /// must keep the default, because those surfaces rely on
+    /// [`CodeEditorEvent::CopiedEmptyText`] to hand an empty-selection copy to the
+    /// parent view that holds the real selection.
+    pub fn set_copy_line_when_selection_is_empty(&mut self, enabled: bool) {
+        self.copy_line_when_selection_is_empty = enabled;
+    }
+
     /// Copy the current selection.
     /// Note that this is _not_ the only possible code path that could copy selected text to the
     /// clipboard. For example, [`CodeEditorView`] exposes a method that allows the owner of the
     /// view to access selected text and copy it to the clipboard.
-    pub fn copy(&self, ctx: &mut ModelContext<Self>) {
+    pub fn copy(&mut self, ctx: &mut ModelContext<Self>) -> CopyOutcome {
+        if !self.selected_text_is_empty(ctx) {
+            self.copy_selection(ctx);
+            return CopyOutcome::Selection;
+        }
+
+        // An editor that owns its copy shortcut outright takes the cursor's line
+        // instead of clearing the clipboard, and handles the copy either way — it
+        // never hands an empty selection to a parent view.
+        if self.copy_line_when_selection_is_empty {
+            let Some(line) = self.current_line_text(ctx) else {
+                // No line to copy, so leave the clipboard as it is rather than
+                // clearing what the user put there earlier.
+                return CopyOutcome::NothingToCopy;
+            };
+            // Recording the text is what lets `paste` put it back as a line: plain
+            // clipboard text would land at the caret and split the line pasted into.
+            ctx.clipboard()
+                .write(ClipboardContent::plain_text(line.clone()));
+            self.line_wise_clipboard = Some(line);
+            return CopyOutcome::CursorLine;
+        }
+
+        // The default: write the empty selection through, which clears the
+        // clipboard exactly as it did before, and let the caller tell a parent view
+        // that the copy may have been meant for its own selection.
+        self.copy_selection(ctx);
+        CopyOutcome::EmptySelection
+    }
+
+    /// Whether the text a copy would put on the clipboard is empty.
+    fn selected_text_is_empty(&self, ctx: &AppContext) -> bool {
+        self.read_selected_text_as_clipboard_content(ctx)
+            .plain_text
+            .is_empty()
+    }
+
+    /// Writes the current selection to the clipboard, which is empty text when
+    /// nothing is selected. This is the copy every surface had before line-wise
+    /// copy existed, and `cut` still uses it so that cutting is unchanged.
+    fn copy_selection(&mut self, ctx: &mut ModelContext<Self>) {
+        self.line_wise_clipboard = None;
         let clipboard = self.read_selected_text_as_clipboard_content(ctx);
         ctx.clipboard().write(clipboard);
     }
@@ -1914,7 +1994,7 @@ impl CodeEditorModel {
     ///
     /// `None` in a document with no line to read, so a caller can leave the
     /// clipboard alone instead of clearing it.
-    pub fn current_line_text(&self, ctx: &AppContext) -> Option<String> {
+    fn current_line_text(&self, ctx: &AppContext) -> Option<String> {
         let range = self.current_line_bounds(ctx);
         if range.start >= range.end {
             return None;
@@ -1930,7 +2010,7 @@ impl CodeEditorModel {
     /// at the caret would split whichever line the caret happened to sit in. The
     /// insert lands before the cursor, so the cursor rides down with the text it
     /// was already on.
-    pub fn paste_line_above_cursor(&mut self, text: &str, ctx: &mut ModelContext<Self>) {
+    fn paste_line_above_cursor(&mut self, text: &str, ctx: &mut ModelContext<Self>) {
         let line_start = self.current_line_bounds(ctx).start;
         // Normalize to exactly one trailing newline, so the inserted text occupies
         // its own line whatever the clipboard happened to carry.
@@ -1953,28 +2033,22 @@ impl CodeEditorModel {
         self.validate(ctx);
     }
 
-    /// The character range of the line holding the primary cursor. The range runs
-    /// to the start of the next line, so it carries the trailing newline whenever
-    /// the line has one, and stops at the end of the buffer on the last line. It
-    /// is empty only in a document that has no line at all.
+    /// The character range of the line holding the primary cursor.
     fn current_line_bounds(&self, ctx: &AppContext) -> Range<CharOffset> {
-        let buffer = self.content().as_ref(ctx);
-        let cursor = self.selections(ctx).first().head;
-        let row = cursor.to_buffer_point(buffer).row;
-        let start = Point::new(row, 0).to_buffer_char_offset(buffer);
-        let end = Point::new(row + 1, 0).to_buffer_char_offset(buffer);
-        start..end
+        self.selection_model
+            .as_ref(ctx)
+            .primary_cursor_line_range(ctx)
     }
 
     #[cfg(windows)]
     /// If there is selected text, copy it. Otherwise, emit an event to allow
     /// an ancestor to handle the `WindowsCtrlC` event.
-    pub fn handle_windows_ctrl_c(&self, ctx: &mut ModelContext<Self>) {
+    pub fn handle_windows_ctrl_c(&mut self, ctx: &mut ModelContext<Self>) {
         let buffer = self.content().as_ref(ctx);
         let selected_text =
             buffer.selected_text_as_plain_text(self.buffer_selection_model().clone(), ctx);
         if !selected_text.as_str().is_empty() {
-            self.copy(ctx);
+            self.copy_selection(ctx);
             // If the code editor is in a blocklist, this won't clear the
             // selection model there, we have to do that separately. That is
             // handled by emitted the `WindowsCtrlC` event.
@@ -1990,7 +2064,10 @@ impl CodeEditorModel {
     }
 
     pub fn cut(&mut self, ctx: &mut ModelContext<Self>) {
-        self.copy(ctx);
+        // Deliberately the selection-only copy: a cut deletes one character, so it
+        // must not take the cursor's line even on an editor whose copy does.
+        // Line-wise cut is tracked separately in #15968.
+        self.copy_selection(ctx);
         self.backspace(ctx);
     }
 
@@ -2164,6 +2241,21 @@ impl CodeEditorModel {
     pub fn paste(&mut self, ctx: &mut ModelContext<Self>) {
         // We only want to read the plain text contents for code editor.
         let content = ctx.clipboard().read();
+
+        // A line this editor copied with an empty selection goes back as a whole
+        // line above the cursor's line, the way VS Code and Zed paste one. The
+        // record only counts while it still matches the clipboard, so anything
+        // copied since — here, in another editor, or in another app — falls back to
+        // a char-wise paste on its own.
+        if self
+            .line_wise_clipboard
+            .as_deref()
+            .is_some_and(|line| line == content.plain_text.as_str())
+        {
+            self.paste_line_above_cursor(&content.plain_text, ctx);
+            return;
+        }
+
         self.insert(content.plain_text.as_str(), EditOrigin::UserInitiated, ctx);
     }
 
